@@ -1,0 +1,28 @@
+services:
+  app:
+    build: ./app
+    container_name: zotify-wrapper
+    ports:
+      - "${PORT:-3106}:${PORT:-3106}"
+    volumes:
+      - ./data:/app/data
+      - ./work:/app/work
+      - ./config:/app/config
+      - ./credentials:/app/credentials
+      - ${NAS_MOUNT:-/mnt/pi-nas/zotify}:/nas/music
+      - ./app/src:/app/src
+      - ./app/public:/app/public
+    environment:
+      - PORT=${PORT:-3106}
+      - DB_PATH=/app/data/downloads.db
+      - WORK_DIR=/app/work
+      - NAS_DIR=/nas/music
+      - ZOTIFY_CONFIG=/app/config/config.json
+      - CREDENTIALS_FILE=/app/credentials/credentials.json
+      - USE_BEETS=${USE_BEETS:-true}
+      - BEETS_CONFIG=/app/config/beets.yaml
+      - MAX_CONCURRENT=${MAX_CONCURRENT:-1}
+      - STALL_TIMEOUT_MS=${STALL_TIMEOUT_MS:-600000}
+      # Empty falls back to the built-in default in downloader.js.
+      - OUTPUT_TEMPLATE=${OUTPUT_TEMPLATE:-}
+    restart: unless-stopped

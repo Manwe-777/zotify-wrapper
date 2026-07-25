@@ -1,0 +1,74 @@
+# beets config for the zotify-wrapper post-download tagger.
+# Library root == the mounted music library (host /mnt/pi-nas/plex/music).
+directory: /nas/music
+library: /app/data/beets-library.db
+
+# Non-interactive import. quiet_fallback: asis => if MusicBrainz has no STRONG
+# match, keep the file's existing (zotify) tags but STILL file it into the library
+# per `paths` below — so nothing is ever left un-filed or lost.
+import:
+  move: yes
+  copy: no
+  write: yes
+  autotag: yes
+  quiet: yes
+  quiet_fallback: asis
+  duplicate_action: skip
+  resume: no
+  incremental: no
+  timid: no
+  log: /app/data/beets-import.log
+
+ui:
+  color: no
+
+# Prefer the original release year (matches how libraries usually name folders).
+original_date: yes
+
+# Folder/file layout — mirrors the Lidarr/Plex library convention.
+# $yeartag (defined via the inline plugin below) is " (2004)" when a year is known,
+# and "" otherwise — so a missing year never produces an ugly "(0000)".
+paths:
+  default: $albumartist/$album$yeartag/$track $title
+  singleton: $artist/Non-Album Singles/$title
+  comp: Various Artists/$album$yeartag/$track $title
+  albumtype:soundtrack: Soundtracks/$album$yeartag/$track $title
+
+# MusicBrainz matching; leaning slightly lenient so quiet mode auto-accepts
+# clearly-correct matches without prompting.
+match:
+  # Spotify-sourced tags (e.g. track total written as /0) add a baseline distance,
+  # so the default 0.04 is far too strict. The correct release lands ~0.10-0.18;
+  # 0.20 auto-applies it while staying below typical wrong-match distances (0.30+).
+  strong_rec_thresh: 0.20
+  medium_rec_thresh: 0.35
+  # By default beets caps the recommendation to "medium" (blocking quiet auto-apply)
+  # whenever tracks are missing/extra — which happens constantly when a standard-edition
+  # download matches MB's deluxe/reissue entry. Allow a confident match anyway.
+  max_rec:
+    missing_tracks: strong
+    unmatched_tracks: strong
+  preferred:
+    countries: ['US', 'GB', 'XW']
+    original_year: yes
+
+# NB: in beets 2.x MusicBrainz is a plugin and MUST be listed explicitly, or every
+# import silently falls back to `asis` (0 candidates).
+plugins: musicbrainz inline fetchart embedart scrub chroma lyrics
+
+# Robust year suffix: prefer the original release year, fall back to release year,
+# and render nothing when neither is known (avoids "(0000)").
+item_fields:
+  yeartag: |
+    y = original_year or year
+    return ' (%d)' % y if y else ''
+
+fetchart:
+  auto: yes
+embedart:
+  auto: yes
+  remove_art_file: no
+scrub:
+  auto: yes
+lyrics:
+  auto: yes

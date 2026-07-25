@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>zotify</title>
+  <link rel="stylesheet" href="styles.css">
+  <script>
+    // Apply cached Glance theme immediately to prevent flash
+    (function() {
+      var KEY = 'glanceThemeCache';
+      var vars = ['bgh','bgs','bgl','cm','tsm'];
+      var colors = ['primary','positive','negative'];
+
+      function apply(gt) {
+        var r = document.documentElement.style;
+        if (gt.scheme === 'light') {
+          r.setProperty('--scheme', '100% -');
+          document.documentElement.setAttribute('data-theme', 'light');
+        } else {
+          r.setProperty('--scheme', ' ');
+          document.documentElement.removeAttribute('data-theme');
+        }
+        vars.forEach(function(k) { if (gt[k]) r.setProperty('--' + k, gt[k]); });
+        colors.forEach(function(k) { if (gt[k]) r.setProperty('--color-' + k, gt[k]); });
+      }
+
+      // Restore from cache on load
+      try {
+        var cached = JSON.parse(localStorage.getItem(KEY));
+        if (cached) apply(cached);
+      } catch(e) {}
+
+      // Listen for live updates from Glance
+      window.addEventListener('message', function(e) {
+        if (e.data && e.data.glanceTheme) {
+          var gt = e.data.glanceTheme;
+          apply(gt);
+          try { localStorage.setItem(KEY, JSON.stringify(gt)); } catch(e) {}
+        }
+      });
+    })();
+  </script>
+</head>
+<body>
+  <div class="container">
+    <form id="add-form" class="add-form">
+      <input id="url-input" type="url" placeholder="Paste Spotify track / album / playlist / artist URL…" required autocomplete="off" spellcheck="false">
+      <button type="submit" id="add-btn" title="Download">+</button>
+    </form>
+
+    <div id="downloads" class="downloads"></div>
+    <div id="empty" class="empty hidden">No downloads yet.</div>
+
+    <div class="footer">
+      <span id="status-bar" class="status-bar"></span>
+      <button id="cleanup" class="btn-secondary" title="Clear finished/failed">Clear done</button>
+    </div>
+  </div>
+  <script src="script.js"></script>
+</body>
+</html>
