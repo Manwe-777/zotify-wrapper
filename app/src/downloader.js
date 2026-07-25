@@ -1,7 +1,7 @@
 import { spawn } from 'child_process';
 import {
   mkdirSync, existsSync, statSync, rmSync, readdirSync,
-  createReadStream, createWriteStream,
+  readFileSync, writeFileSync, createReadStream, createWriteStream,
 } from 'fs';
 import { join, relative, dirname, basename } from 'path';
 import { pipeline } from 'stream/promises';
@@ -21,6 +21,16 @@ const OUTPUT_TEMPLATE =
 // to skip it and fall back to a plain copy into the library.
 const USE_BEETS = (process.env.USE_BEETS ?? 'true') !== 'false';
 const BEETS_CONFIG = process.env.BEETS_CONFIG || '/app/config/beets.yaml';
+// zotify's global song archive: SONG_ARCHIVE_LOCATION from config.json + '/.song_archive'.
+// It only becomes active once this file exists (zotify disables the archive when it's
+// missing), so creating/deleting it is the on/off switch for skip-previously-downloaded.
+const SONG_ARCHIVE = process.env.SONG_ARCHIVE || '/app/data/.song_archive';
+// beets organises into this LOCAL dir (it must match `directory:` in beets.yaml),
+// then we ship the result to the NAS ourselves in one sequential pass. beets does
+// several whole-file passes per track — scrub strips tags, then it writes corrected
+// tags and embeds the cover — and on CIFS each pass pays the SMB round-trip penalty:
+// measured 31s/track to local disk vs minutes/track straight onto the NAS.
+const LIB_STAGE = process.env.LIB_STAGE || '/app/work/.lib-stage';
 
 // zotify/tqdm emit progress on stderr with carriage returns, e.g. " 45%|███ | 12/26 ..."
 const PCT_RE = /(\d{1,3})%\|/;
@@ -63,7 +73,12 @@ function titleFromFiles(files) {
 export class Downloader {
   constructor(db) {
     this.db = db;
-    this.active = new Map();
+    this.active = new Map();      // id -> live zotify child (download phase only)
+    this.movers = new Map();      // id -> live beet child (moving phase only)
+    // A job holds a concurrency slot for its WHOLE lifecycle — download *and* the
+    // beets/NAS phase. `active` empties as soon as zotify exits, which is minutes
+    // before the job is actually finished, so it can't be the thing tick() gates on.
+    this.busy = new Set();
     this.tracksTotal = new Map(); // id -> total track count parsed from zotify output
     mkdirSync(WORK_DIR, { recursive: true });
     try { mkdirSync(NAS_DIR, { recursive: true }); } catch {}
@@ -92,16 +107,24 @@ export class Downloader {
     if (!row) return false;
     const proc = this.active.get(id);
     if (proc) { try { proc.kill('SIGTERM'); } catch {} }
+    // A job in 'moving' has no zotify left — it's beets that has to be stopped.
+    const mover = this.movers.get(id);
+    if (mover) { try { mover.kill('SIGTERM'); } catch {} }
     this.db.prepare(`
       UPDATE downloads SET status = 'cancelled', updated_at = ?, pid = NULL WHERE id = ?
     `).run(Date.now(), id);
     this.active.delete(id);
-    this._cleanupJobDir(id);
+    this.movers.delete(id);
+    this.busy.delete(id);
+    this._discardJob(id);
     this.tick();
     return true;
   }
 
   retry(id) {
+    // Belt and braces: the failure paths already prune, but never let a retry
+    // inherit archive entries — that's what silently yields a partial album.
+    this._discardJob(id);
     this.db.prepare(`
       UPDATE downloads
       SET status = 'queued', progress = 0, error = NULL, pid = NULL, updated_at = ?
@@ -117,20 +140,48 @@ export class Downloader {
   }
 
   tick() {
-    if (this.active.size >= MAX_CONCURRENT) return;
+    if (this.busy.size >= MAX_CONCURRENT) return;
+    // created_at is milliseconds, so a burst of pasted URLs can tie; id breaks it
+    // so the queue is strictly FIFO in the order they were added.
     const next = this.db.prepare(`
       SELECT * FROM downloads WHERE status = 'queued'
-      ORDER BY created_at ASC LIMIT 1
+      ORDER BY created_at ASC, id ASC LIMIT 1
     `).get();
     if (!next) return;
     this.start(next);
-    if (this.active.size < MAX_CONCURRENT) this.tick();
+    if (this.busy.size < MAX_CONCURRENT) this.tick();
   }
 
   _jobDir(id) { return join(WORK_DIR, `job-${id}`); }
 
   _cleanupJobDir(id) {
     try { rmSync(this._jobDir(id), { recursive: true, force: true }); } catch {}
+  }
+
+  // zotify appends to the archive per track, the moment each file is written — so a
+  // job that dies half-way leaves its finished tracks archived while we delete the
+  // files. A retry would then skip exactly those tracks and hand back a partial
+  // album. The archive records the staging path, so this job's entries are precisely
+  // the lines pointing into its job dir.
+  _pruneArchive(id) {
+    if (!existsSync(SONG_ARCHIVE)) return 0;
+    const prefix = `${this._jobDir(id)}/`;
+    let lines;
+    try { lines = readFileSync(SONG_ARCHIVE, 'utf8').split('\n'); } catch { return 0; }
+    const keep = lines.filter((l) => !l.trim() || !l.split('\t').pop().startsWith(prefix));
+    const dropped = lines.length - keep.length;
+    if (dropped) {
+      try { writeFileSync(SONG_ARCHIVE, keep.join('\n')); } catch { return 0; }
+    }
+    return dropped;
+  }
+
+  // The job's files are being thrown away without reaching the library, so its
+  // archive entries have to go too — otherwise those tracks are unreachable forever.
+  _discardJob(id) {
+    const dropped = this._pruneArchive(id);
+    if (dropped) console.log(`[${id}] dropped ${dropped} archive entries so a retry re-downloads them`);
+    this._cleanupJobDir(id);
   }
 
   start(row) {
@@ -163,6 +214,7 @@ export class Downloader {
 
     const proc = spawn('zotify', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     this.active.set(id, proc);
+    this.busy.add(id); // released only once the job is fully filed (see close handler)
     this.db.prepare(`
       UPDATE downloads SET status = 'downloading', pid = ?, progress = 0, updated_at = ? WHERE id = ?
     `).run(proc.pid, Date.now(), id);
@@ -210,65 +262,72 @@ export class Downloader {
     wire(proc.stderr);
 
     proc.on('close', async (code) => {
+      // zotify is gone, but the job still owns its slot until it's filed into the
+      // library — dropping `busy` here is what let the next album start early.
       this.active.delete(id);
       this.tracksTotal.delete(id);
-      const current = this.db.prepare(`SELECT status FROM downloads WHERE id = ?`).get(id);
-      if (current?.status === 'cancelled' || current?.status === 'stalled') {
-        this._cleanupJobDir(id);
-        this.tick();
-        return;
-      }
+      try {
+        const current = this.db.prepare(`SELECT status FROM downloads WHERE id = ?`).get(id);
+        if (current?.status === 'cancelled' || current?.status === 'stalled') {
+          this._discardJob(id);
+          return;
+        }
 
-      const produced = existsSync(jobDir) ? this._listFiles(jobDir) : [];
-      if (code === 0 && produced.length) {
-        try {
-          const title = titleFromFiles(produced);
-          const audio = produced.filter((f) => AUDIO_RE.test(f));
-          // Size up now, before the files leave the staging dir.
-          const bytes = audio.reduce((s, f) => {
-            try { return s + statSync(f).size; } catch { return s; }
-          }, 0);
-          const info = audio[0]
-            ? albumInfoFromRel(relative(jobDir, audio[0]))
-            : { artist: null, album: null, year: null };
-          const finalTracks = audio
-            .map((f) => ({ ...parseTrackName(f), done: true }))
-            .sort((a, b) => (a.num ?? 9999) - (b.num ?? 9999));
-          await this.fileIntoLibrary(id, jobDir);
-          this.db.prepare(`
-            UPDATE downloads
-            SET status = 'completed', progress = 100, file_path = ?, file_size = ?,
-                title = ?, album = ?, artist = ?, year = ?,
-                tracks_done = ?, tracks_total = ?, current_track = NULL, tracks_json = ?,
-                completed_at = ?, updated_at = ?, pid = NULL, eta = NULL, speed = NULL
-            WHERE id = ?
-          `).run(
-            NAS_DIR, bytes, title, info.album, info.artist, info.year,
-            audio.length, audio.length, JSON.stringify(finalTracks),
-            Date.now(), Date.now(), id,
-          );
-        } catch (err) {
+        const produced = existsSync(jobDir) ? this._listFiles(jobDir) : [];
+        if (code === 0 && produced.length) {
+          try {
+            const title = titleFromFiles(produced);
+            const audio = produced.filter((f) => AUDIO_RE.test(f));
+            // Size up now, before the files leave the staging dir.
+            const bytes = audio.reduce((s, f) => {
+              try { return s + statSync(f).size; } catch { return s; }
+            }, 0);
+            const info = audio[0]
+              ? albumInfoFromRel(relative(jobDir, audio[0]))
+              : { artist: null, album: null, year: null };
+            const finalTracks = audio
+              .map((f) => ({ ...parseTrackName(f), done: true }))
+              .sort((a, b) => (a.num ?? 9999) - (b.num ?? 9999));
+            await this.fileIntoLibrary(id, jobDir);
+            this.db.prepare(`
+              UPDATE downloads
+              SET status = 'completed', progress = 100, file_path = ?, file_size = ?,
+                  title = ?, album = ?, artist = ?, year = ?,
+                  tracks_done = ?, tracks_total = ?, current_track = NULL, tracks_json = ?,
+                  completed_at = ?, updated_at = ?, pid = NULL, eta = NULL, speed = NULL
+              WHERE id = ?
+            `).run(
+              NAS_DIR, bytes, title, info.album, info.artist, info.year,
+              audio.length, audio.length, JSON.stringify(finalTracks),
+              Date.now(), Date.now(), id,
+            );
+          } catch (err) {
+            this.db.prepare(`
+              UPDATE downloads SET status = 'failed', error = ?, updated_at = ?, pid = NULL WHERE id = ?
+            `).run(`move to NAS failed: ${err.message}`, Date.now(), id);
+          }
+        } else {
+          const errMsg = tail.split('\n').filter(l => /error|invalid|premium|credential|failed/i.test(l))
+            .slice(-4).join('\n').trim() || tail.slice(-500).trim() || `zotify exited ${code} with no files`;
           this.db.prepare(`
             UPDATE downloads SET status = 'failed', error = ?, updated_at = ?, pid = NULL WHERE id = ?
-          `).run(`move to NAS failed: ${err.message}`, Date.now(), id);
+          `).run(errMsg, Date.now(), id);
+          this._discardJob(id);
         }
-      } else {
-        const errMsg = tail.split('\n').filter(l => /error|invalid|premium|credential|failed/i.test(l))
-          .slice(-4).join('\n').trim() || tail.slice(-500).trim() || `zotify exited ${code} with no files`;
-        this.db.prepare(`
-          UPDATE downloads SET status = 'failed', error = ?, updated_at = ?, pid = NULL WHERE id = ?
-        `).run(errMsg, Date.now(), id);
-        this._cleanupJobDir(id);
+      } finally {
+        this.movers.delete(id);
+        this.busy.delete(id);
+        this.tick();
       }
-      this.tick();
     });
 
     proc.on('error', (err) => {
       this.active.delete(id);
+      this.busy.delete(id);
       this.db.prepare(`
         UPDATE downloads SET status = 'failed', error = ?, updated_at = ?, pid = NULL WHERE id = ?
       `).run(`spawn error: ${err.message}`, Date.now(), id);
-      this._cleanupJobDir(id);
+      this._discardJob(id);
       this.tick();
     });
   }
@@ -323,18 +382,49 @@ export class Downloader {
   // If beets is off or fails, fall back to a plain structure-preserving copy so
   // files are never stranded.
   async fileIntoLibrary(id, jobDir) {
-    this.db.prepare(`UPDATE downloads SET status = 'moving', updated_at = ? WHERE id = ?`)
+    // Clear pid: zotify has exited, and a dead pid left in the row would make the
+    // stall-reaper SIGKILL whatever process the kernel has since recycled it onto.
+    this.db.prepare(`UPDATE downloads SET status = 'moving', pid = NULL, updated_at = ? WHERE id = ?`)
       .run(Date.now(), id);
     if (USE_BEETS) {
       try {
         await this.beetsImport(id, jobDir);
-        this._cleanupJobDir(id); // beets moved the audio; drop leftover .lrc/.log/.song_ids
+        // beets exits 0 even when it imported NOTHING — e.g. it skips any directory
+        // its `ignore`/`ignore_hidden` rules match, which is what silently ate
+        // "...Like Clockwork" (leading dots read as a hidden dir). So never take
+        // exit 0 as proof the audio moved: only drop the staging dir once it's
+        // actually empty of audio, and hand anything left over to the raw copy.
+        const leftover = existsSync(jobDir)
+          ? this._listFiles(jobDir).filter((f) => AUDIO_RE.test(f))
+          : [];
+        if (leftover.length) {
+          console.log(`[${id}] beets imported nothing (${leftover.length} track(s) still staged); copying as-is`);
+          await this.moveToNas(id, jobDir);
+        } else {
+          this._cleanupJobDir(id); // beets took the audio; drop leftover .lrc/.log/.song_ids
+        }
+        await this._flushLibStage(id);
         return;
       } catch (err) {
         console.log(`[${id}] beets import failed (${err.message}); falling back to raw copy`);
+        await this._flushLibStage(id); // it may have organised some tracks already
       }
     }
     await this.moveToNas(id, jobDir);
+  }
+
+  // Ship whatever beets organised into the local staging library over to the NAS in
+  // one sequential copy. Self-healing: anything a crashed run left behind is picked
+  // up by the next job rather than being stranded.
+  async _flushLibStage(id) {
+    if (!existsSync(LIB_STAGE)) return;
+    const files = this._listFiles(LIB_STAGE);
+    if (!files.length) {
+      try { rmSync(LIB_STAGE, { recursive: true, force: true }); } catch {}
+      return;
+    }
+    console.log(`[${id}] shipping ${files.length} file(s) from the local library to the NAS`);
+    await this.moveToNas(id, LIB_STAGE);
   }
 
   // Run `beet import` over the staging dir. beets moves audio into `directory`
@@ -343,6 +433,7 @@ export class Downloader {
     return new Promise((resolve, reject) => {
       const args = ['-c', BEETS_CONFIG, 'import', '-q', jobDir];
       const p = spawn('beet', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+      this.movers.set(id, p);
       let err = '';
       const beat = setInterval(() => {
         // keep the row fresh so the stall-reaper doesn't fire during a long MB lookup
@@ -353,27 +444,34 @@ export class Downloader {
       p.stdout.on('data', () => {});
       p.on('close', (code) => {
         clearInterval(beat);
+        this.movers.delete(id);
         code === 0 ? resolve() : reject(new Error(`beet exit ${code}: ${err.trim()}`));
       });
-      p.on('error', (e) => { clearInterval(beat); reject(e); });
+      p.on('error', (e) => { clearInterval(beat); this.movers.delete(id); reject(e); });
     });
   }
 
-  // Copy the job tree into NAS_DIR preserving album-folder structure, then drop the local copy.
-  // Copy-then-unlink because CIFS can't rename across the mount boundary.
-  async moveToNas(id, jobDir) {
-    this.db.prepare(`UPDATE downloads SET status = 'moving', updated_at = ? WHERE id = ?`)
+  // Copy a tree into NAS_DIR preserving album-folder structure, then drop the source.
+  // Copy-then-unlink because CIFS can't rename across the mount boundary. Used both
+  // for the raw fallback (source = the job dir) and to ship beets' organised output
+  // (source = the local staging library).
+  async moveToNas(id, srcDir) {
+    // Clear pid: zotify has exited, and a dead pid left in the row would make the
+    // stall-reaper SIGKILL whatever process the kernel has since recycled it onto.
+    this.db.prepare(`UPDATE downloads SET status = 'moving', pid = NULL, updated_at = ? WHERE id = ?`)
       .run(Date.now(), id);
-    const files = this._listFiles(jobDir);
+    const files = this._listFiles(srcDir);
     let bytes = 0;
     for (const src of files) {
-      const rel = relative(jobDir, src);
+      const rel = relative(srcDir, src);
       const dest = join(NAS_DIR, rel);
       mkdirSync(dirname(dest), { recursive: true });
       await pipeline(createReadStream(src), createWriteStream(dest));
       bytes += statSync(dest).size;
     }
-    this._cleanupJobDir(id);
+    // Drop the source we were actually given, not the job dir — otherwise the
+    // staging library would survive and be re-shipped on every subsequent job.
+    try { rmSync(srcDir, { recursive: true, force: true }); } catch {}
     return { bytes, count: files.length };
   }
 
@@ -384,11 +482,13 @@ export class Downloader {
       WHERE status IN ('downloading','moving') AND updated_at < ?
     `).all(cutoff);
     for (const row of stalled) {
-      const proc = this.active.get(row.id);
+      const proc = this.active.get(row.id) || this.movers.get(row.id);
       if (proc) { try { proc.kill('SIGKILL'); } catch {} }
       else if (row.pid) { try { process.kill(row.pid, 'SIGKILL'); } catch {} }
       this.active.delete(row.id);
-      this._cleanupJobDir(row.id);
+      this.movers.delete(row.id);
+      this.busy.delete(row.id);
+      this._discardJob(row.id);
       this.db.prepare(`
         UPDATE downloads SET status = 'stalled', error = 'no progress (possible auth prompt or rate-limit)', updated_at = ?, pid = NULL WHERE id = ?
       `).run(Date.now(), row.id);

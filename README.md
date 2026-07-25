@@ -71,7 +71,32 @@ Then `cd ~/glance && docker compose restart`.
 
 ## Notes / knobs
 
-- `config/config.json` — quality (`DOWNLOAD_QUALITY`), format (`DOWNLOAD_FORMAT`:
-  `mp3` for max compatibility, `ogg` to keep Spotify's native codec lossless-of-source).
-- `MAX_CONCURRENT=1` in `.env` — Spotify rate-limits hard; leave it at 1.
+- `config/config.json` — quality (`DOWNLOAD_QUALITY`), format (`DOWNLOAD_FORMAT`). Set to
+  `ogg`: Spotify streams Ogg Vorbis, so zotify maps `ogg` to a ffmpeg stream **copy** —
+  no re-encode, so the file is bit-identical to what Spotify sent (with `very_high` that's
+  320 kbps Vorbis). `mp3` decodes and re-encodes, i.e. a generation of lossy loss, for
+  players that can't read Vorbis. Every track is available as `ogg` — it's the source
+  format, not an alternate one. (Podcast *episodes* are the exception: they aren't Vorbis,
+  so `ogg` re-encodes them via `libvorbis`.)
+- `MAX_CONCURRENT=1` in `.env` — Spotify rate-limits hard; leave it at 1. A job holds
+  its slot for its *whole* lifecycle, download **and** the beets/NAS phase, so two
+  albums never overlap.
+- **Song archive** — `SONG_ARCHIVE_LOCATION` + `SKIP_PREVIOUSLY_DOWNLOADED` in
+  `config/config.json` make zotify skip tracks it has already pulled, so re-queueing an
+  album you own costs no bandwidth and no rate-limit exposure. zotify treats the archive
+  as *disabled while the file is missing*, so `data/.song_archive` is the on/off switch:
+
+  ```bash
+  touch data/.song_archive     # enable
+  rm    data/.song_archive     # disable (entries are kept if you just move it aside)
+  ```
+
+  Entries are `id⇥timestamp⇥artist⇥title⇥path`, appended per track as it lands. The
+  wrapper prunes a job's entries whenever its files are discarded (cancel, failure,
+  stall, retry) — otherwise a retry would skip those tracks and quietly produce a
+  partial album. To force a re-download of something you deleted by hand, drop its
+  line from `data/.song_archive`.
+- Nothing is deleted from a job's staging dir until the audio has provably left it.
+  beets exits 0 even when it imports nothing (e.g. it skips a directory), so a raw
+  copy to the NAS is the fallback rather than an `rm -rf`.
 - Legal: this is against Spotify's ToS. Personal/testing use, your call.

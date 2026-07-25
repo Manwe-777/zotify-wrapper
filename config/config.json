@@ -1,7 +1,7 @@
 {
   "CREDENTIALS_LOCATION": "/app/credentials/credentials.json",
   "ROOT_PATH": "/app/work",
-  "DOWNLOAD_FORMAT": "mp3",
+  "DOWNLOAD_FORMAT": "ogg",
   "DOWNLOAD_QUALITY": "very_high",
   "DOWNLOAD_RATE_LIMITER": 0.5,
   "PRINT_DOWNLOADS": true,
@@ -9,6 +9,8 @@
   "PRINT_SKIPS": true,
   "PRINT_ERRORS": true,
   "SKIP_EXISTING": true,
+  "SKIP_PREVIOUSLY_DOWNLOADED": true,
+  "SONG_ARCHIVE_LOCATION": "/app/data",
   "DOWNLOAD_LYRICS": false,
   "MD_SAVE_GENRES": true,
   "RETRY_ATTEMPTS": 3

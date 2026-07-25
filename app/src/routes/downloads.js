@@ -23,6 +23,9 @@ router.get('/downloads', (req, res) => {
         WHEN 'completed' THEN 3
         ELSE 4
       END,
+      -- Queued rows list in the order they'll actually run (FIFO); everything else
+      -- lists newest-first. NULL for non-queued rows, so it's a no-op there.
+      CASE WHEN status = 'queued' THEN created_at END ASC,
       created_at DESC
     LIMIT ?
   `).all(limit);

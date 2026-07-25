@@ -1,6 +1,10 @@
 # beets config for the zotify-wrapper post-download tagger.
-# Library root == the mounted music library (host /mnt/pi-nas/plex/music).
-directory: /nas/music
+# `directory` is a LOCAL staging library, NOT the NAS, and must match LIB_STAGE in
+# downloader.js — the wrapper copies the organised result to /nas/music itself.
+# beets makes several whole-file passes per track (scrub strips tags, then it writes
+# corrected tags and embeds the cover); doing those over CIFS costs minutes per track
+# versus ~31s on local disk, which is what made the queue look hung.
+directory: /app/work/.lib-stage
 library: /app/data/beets-library.db
 
 # Non-interactive import. quiet_fallback: asis => if MusicBrainz has no STRONG
@@ -21,6 +25,23 @@ import:
 
 ui:
   color: no
+
+# Album names legitimately start with dots ("...Like Clockwork", "...And Justice
+# for All"), and zotify names the folder after the album. beets' defaults treat
+# those as hidden — `ignore_hidden: yes` plus the bare `.*` glob in `ignore` —
+# so it silently skipped the whole directory and imported nothing. Replace the
+# catch-all with the actual junk we want skipped.
+ignore_hidden: no
+ignore:
+  - '.DS_Store'
+  - '._*'
+  - '.AppleDouble'
+  - '.Trashes'
+  - '.Spotlight-V100'
+  - '.fseventsd'
+  - '*~'
+  - 'System Volume Information'
+  - 'lost+found'
 
 # Prefer the original release year (matches how libraries usually name folders).
 original_date: yes
@@ -70,5 +91,10 @@ embedart:
   remove_art_file: no
 scrub:
   auto: yes
+# lyrics is OFF: it does a per-track web lookup across several backends, and zotify
+# is already configured with DOWNLOAD_LYRICS: false, so nothing wanted them anyway.
+# Measured cost of chroma+lyrics together: ~10s/track (23s vs 13s per track on a
+# local-disk import). Everything else here is cheap — a tag write plus a 722KB
+# embedded cover is ~0.5s per ogg even over CIFS.
 lyrics:
-  auto: yes
+  auto: no
