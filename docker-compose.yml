@@ -25,4 +25,9 @@ services:
       - STALL_TIMEOUT_MS=${STALL_TIMEOUT_MS:-600000}
       # Empty falls back to the built-in default in downloader.js.
       - OUTPUT_TEMPLATE=${OUTPUT_TEMPLATE:-}
+      # Read-only Lidarr lookup: pins beets to the release Lidarr already monitors.
+      # Must be the LAN address, not a container name — these aren't on one network.
+      # Leave LIDARR_URL empty to disable and let beets choose on its own.
+      - LIDARR_URL=${LIDARR_URL:-}
+      - LIDARR_API_KEY=${LIDARR_API_KEY:-}
     restart: unless-stopped

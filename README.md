@@ -99,4 +99,23 @@ Then `cd ~/glance && docker compose restart`.
 - Nothing is deleted from a job's staging dir until the audio has provably left it.
   beets exits 0 even when it imports nothing (e.g. it skips a directory), so a raw
   copy to the NAS is the fallback rather than an `rm -rf`.
+- **Release pinning (`LIDARR_URL` / `LIDARR_API_KEY`)** — beets and Lidarr each run
+  their own MusicBrainz match, and they regularly land on *different releases* of the
+  same album (beets matched Clayman to the 12-track JP release while Lidarr monitored
+  the 13-track US one). Lidarr then only matches the subset of tracks that line up, and
+  Navidrome — which keys albums on `MusicBrainz Album Id` — draws the album twice. With
+  these set, the wrapper asks Lidarr which release it monitors and passes it to
+  `beet import -S <mbid>`, so both sides agree before a single tag is written. Matching
+  is exact-then-unique-prefix on the album title, because Spotify drops subtitles
+  ("Reroute To Remain" vs "Reroute to Remain: Fourteen Songs of Conscious Insanity").
+  Entirely best-effort: Lidarr down, album not in Lidarr, or an ambiguous title all fall
+  back to beets choosing on its own, exactly as before. Leave `LIDARR_URL` empty to
+  disable. Use the LAN address — the two containers aren't on a shared docker network.
+- **Partial imports are no longer copied in.** `match.max_rec.unmatched_tracks: strong`
+  lets beets auto-accept a release with *fewer* tracks than were downloaded, orphaning
+  the extras with nothing but zotify's bare Spotify tags. Dropping those next to
+  properly tagged files is what splits an album in Navidrome. When beets tags some
+  tracks but not all, the tagged ones are filed and the rest are **left in
+  `work/job-<id>`** with a warning on the job in the UI, rather than landing in the
+  library untagged.
 - Legal: this is against Spotify's ToS. Personal/testing use, your call.

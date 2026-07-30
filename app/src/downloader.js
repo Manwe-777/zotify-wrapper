@@ -31,6 +31,17 @@ const SONG_ARCHIVE = process.env.SONG_ARCHIVE || '/app/data/.song_archive';
 // tags and embeds the cover — and on CIFS each pass pays the SMB round-trip penalty:
 // measured 31s/track to local disk vs minutes/track straight onto the NAS.
 const LIB_STAGE = process.env.LIB_STAGE || '/app/work/.lib-stage';
+// Lidarr, used read-only to ask which MusicBrainz *release* it monitors for an album.
+// beets otherwise runs its own MB match with its own preferences (see `preferred:` in
+// beets.yaml) and regularly lands on a different release than Lidarr — e.g. Clayman
+// matched the 12-track JP release while Lidarr monitored the 13-track US one. Both
+// sides then disagree about which tracks belong, Lidarr only matches the subset that
+// lines up, and Navidrome (which keys albums on MusicBrainz Album Id) draws the album
+// twice. Pinning beets to Lidarr's release removes the disagreement at the source.
+// Reachable over the LAN, not the docker bridge — the containers aren't on one network.
+const LIDARR_URL = (process.env.LIDARR_URL || '').replace(/\/+$/, '');
+const LIDARR_API_KEY = process.env.LIDARR_API_KEY || '';
+const LIDARR_TIMEOUT_MS = parseInt(process.env.LIDARR_TIMEOUT_MS || '8000', 10);
 
 // zotify/tqdm emit progress on stderr with carriage returns, e.g. " 45%|███ | 12/26 ..."
 const PCT_RE = /(\d{1,3})%\|/;
@@ -288,7 +299,7 @@ export class Downloader {
             const finalTracks = audio
               .map((f) => ({ ...parseTrackName(f), done: true }))
               .sort((a, b) => (a.num ?? 9999) - (b.num ?? 9999));
-            await this.fileIntoLibrary(id, jobDir);
+            await this.fileIntoLibrary(id, jobDir, info);
             this.db.prepare(`
               UPDATE downloads
               SET status = 'completed', progress = 100, file_path = ?, file_size = ?,
@@ -378,17 +389,79 @@ export class Downloader {
     return out;
   }
 
+  // Surface a problem on a job that still "succeeded". The UI renders `error`
+  // whenever it's set, regardless of status, so this shows up without pretending
+  // the tracks that did land were lost.
+  _warn(id, msg) {
+    console.log(`[${id}] ${msg}`);
+    try {
+      this.db.prepare(`UPDATE downloads SET error = ?, updated_at = ? WHERE id = ?`)
+        .run(msg, Date.now(), id);
+    } catch {}
+  }
+
+  // Ask Lidarr which release it monitors for this album, so beets can be pinned to it.
+  // Best-effort by design: any miss (Lidarr down, album not in Lidarr, no monitored
+  // release) returns null and beets picks for itself exactly as before.
+  async _lidarrReleaseId(id, info) {
+    if (!LIDARR_URL || !LIDARR_API_KEY || !info?.artist || !info?.album) return null;
+    const norm = (s) => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+    try {
+      const get = async (path) => {
+        const r = await fetch(`${LIDARR_URL}${path}`, {
+          headers: { 'X-Api-Key': LIDARR_API_KEY },
+          signal: AbortSignal.timeout(LIDARR_TIMEOUT_MS),
+        });
+        if (!r.ok) throw new Error(`${path} -> HTTP ${r.status}`);
+        return r.json();
+      };
+      const artist = (await get('/api/v1/artist'))
+        .find((a) => norm(a.artistName) === norm(info.artist));
+      if (!artist) return null;
+      const albums = await get(`/api/v1/album?artistId=${artist.id}`);
+      // Spotify and MusicBrainz disagree about subtitles — Spotify ships "Reroute To
+      // Remain" where Lidarr has "Reroute to Remain: Fourteen Songs of Conscious
+      // Insanity". Exact match first, then a prefix match, but only when it is
+      // unambiguous: two candidates means we can't tell which, so let beets decide
+      // rather than pin the wrong release.
+      let album = albums.find((a) => norm(a.title) === norm(info.album));
+      if (!album) {
+        const want = norm(info.album);
+        const near = albums.filter((a) => {
+          const got = norm(a.title);
+          return got.startsWith(want) || want.startsWith(got);
+        });
+        if (near.length === 1) album = near[0];
+      }
+      if (!album) return null;
+      const rel = (album.releases || []).find((r) => r.monitored);
+      if (!rel?.foreignReleaseId) return null;
+      console.log(
+        `[${id}] pinning beets to Lidarr's release ${rel.foreignReleaseId} ` +
+        `(${rel.trackCount} tracks) for ${info.artist} - ${info.album}`,
+      );
+      return rel.foreignReleaseId;
+    } catch (err) {
+      console.log(`[${id}] Lidarr release lookup failed (${err.message}); letting beets choose`);
+      return null;
+    }
+  }
+
   // Get the finished tracks into the library. With beets: MusicBrainz-tag + organize.
   // If beets is off or fails, fall back to a plain structure-preserving copy so
   // files are never stranded.
-  async fileIntoLibrary(id, jobDir) {
+  async fileIntoLibrary(id, jobDir, info = {}) {
     // Clear pid: zotify has exited, and a dead pid left in the row would make the
     // stall-reaper SIGKILL whatever process the kernel has since recycled it onto.
     this.db.prepare(`UPDATE downloads SET status = 'moving', pid = NULL, updated_at = ? WHERE id = ?`)
       .run(Date.now(), id);
     if (USE_BEETS) {
       try {
-        await this.beetsImport(id, jobDir);
+        // Snapshot the staging library first: a previous run that crashed mid-flush
+        // leaves files here, and counting those as "this job imported something"
+        // would misread a total failure as a partial one.
+        const before = new Set(existsSync(LIB_STAGE) ? this._listFiles(LIB_STAGE) : []);
+        await this.beetsImport(id, jobDir, await this._lidarrReleaseId(id, info));
         // beets exits 0 even when it imported NOTHING — e.g. it skips any directory
         // its `ignore`/`ignore_hidden` rules match, which is what silently ate
         // "...Like Clockwork" (leading dots read as a hidden dir). So never take
@@ -397,6 +470,25 @@ export class Downloader {
         const leftover = existsSync(jobDir)
           ? this._listFiles(jobDir).filter((f) => AUDIO_RE.test(f))
           : [];
+        const staged = (existsSync(LIB_STAGE) ? this._listFiles(LIB_STAGE) : [])
+          .filter((f) => AUDIO_RE.test(f) && !before.has(f));
+        // PARTIAL import: beets tagged some tracks and left others behind, which is
+        // what `max_rec.unmatched_tracks: strong` allows — it auto-accepts a release
+        // with fewer tracks than we downloaded, orphaning the extras. Raw-copying
+        // those extras drops files carrying nothing but zotify's bare Spotify tags
+        // next to properly tagged ones, and that alone splits the album in Navidrome
+        // (it's where "13. World of Promises.ogg" came from). Ship only what beets
+        // tagged and leave the rest in the job dir for a human.
+        if (leftover.length && staged.length) {
+          this._warn(id,
+            `beets matched a release missing ${leftover.length} of ` +
+            `${leftover.length + staged.length} downloaded track(s): ` +
+            `${leftover.map((f) => basename(f)).join(', ')}. ` +
+            `Tagged tracks were filed; the unmatched ones were NOT copied to the ` +
+            `library (they would split the album). They are in ${this._jobDir(id)}`);
+          await this._flushLibStage(id);
+          return;
+        }
         if (leftover.length) {
           console.log(`[${id}] beets imported nothing (${leftover.length} track(s) still staged); copying as-is`);
           await this.moveToNas(id, jobDir);
@@ -429,9 +521,15 @@ export class Downloader {
 
   // Run `beet import` over the staging dir. beets moves audio into `directory`
   // (the library) per its `paths`, writing corrected tags. Non-interactive.
-  beetsImport(id, jobDir) {
+  // `searchId` (when Lidarr supplied one) is passed as `-S/--search-id`, which makes
+  // that MusicBrainz release the candidate beets scores first. It's a strong hint, not
+  // a hard override: if the audio genuinely doesn't fit, beets still falls back to its
+  // normal search rather than force-applying a wrong release.
+  beetsImport(id, jobDir, searchId = null) {
     return new Promise((resolve, reject) => {
-      const args = ['-c', BEETS_CONFIG, 'import', '-q', jobDir];
+      const args = ['-c', BEETS_CONFIG, 'import', '-q'];
+      if (searchId) args.push('-S', searchId);
+      args.push(jobDir);
       const p = spawn('beet', args, { stdio: ['ignore', 'pipe', 'pipe'] });
       this.movers.set(id, p);
       let err = '';
