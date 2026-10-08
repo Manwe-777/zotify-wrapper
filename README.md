@@ -83,15 +83,11 @@ Then `cd ~/glance && docker compose restart`.
   albums never overlap.
 - **Song archive** — `SONG_ARCHIVE_LOCATION` + `SKIP_PREVIOUSLY_DOWNLOADED` in
   `config/config.json` make zotify skip tracks it has already pulled, so re-queueing an
-  album you own costs no bandwidth and no rate-limit exposure. zotify treats the archive
-  as *disabled while the file is missing*, so `data/.song_archive` is the on/off switch:
+  album you own costs no bandwidth and no rate-limit exposure. zotify creates
+  `data/.song_archive` itself; to turn the archive off set `"DISABLE_SONG_ARCHIVE": true`
+  in `config/config.json`.
 
-  ```bash
-  touch data/.song_archive     # enable
-  rm    data/.song_archive     # disable (entries are kept if you just move it aside)
-  ```
-
-  Entries are `id⇥timestamp⇥artist⇥title⇥path`, appended per track as it lands. The
+  Entries are `id⇥timestamp⇥artist⇥title⇥path⇥isrc`, appended per track as it lands. The
   wrapper prunes a job's entries whenever its files are discarded (cancel, failure,
   stall, retry) — otherwise a retry would skip those tracks and quietly produce a
   partial album. To force a re-download of something you deleted by hand, drop its

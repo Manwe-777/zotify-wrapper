@@ -22,9 +22,10 @@ const OUTPUT_TEMPLATE =
 const USE_BEETS = (process.env.USE_BEETS ?? 'true') !== 'false';
 const BEETS_CONFIG = process.env.BEETS_CONFIG || '/app/config/beets.yaml';
 // zotify's global song archive: SONG_ARCHIVE_LOCATION from config.json + '/.song_archive'.
-// It only becomes active once this file exists (zotify disables the archive when it's
-// missing), so creating/deleting it is the on/off switch for skip-previously-downloaded.
+// Tab-separated: id, timestamp, artist, title, path, isrc. Index the path column —
+// it is not the last field.
 const SONG_ARCHIVE = process.env.SONG_ARCHIVE || '/app/data/.song_archive';
+const ARCHIVE_PATH_COL = 4;
 // beets organises into this LOCAL dir (it must match `directory:` in beets.yaml),
 // then we ship the result to the NAS ourselves in one sequential pass. beets does
 // several whole-file passes per track — scrub strips tags, then it writes corrected
@@ -179,7 +180,7 @@ export class Downloader {
     const prefix = `${this._jobDir(id)}/`;
     let lines;
     try { lines = readFileSync(SONG_ARCHIVE, 'utf8').split('\n'); } catch { return 0; }
-    const keep = lines.filter((l) => !l.trim() || !l.split('\t').pop().startsWith(prefix));
+    const keep = lines.filter((l) => !(l.split('\t')[ARCHIVE_PATH_COL] || '').startsWith(prefix));
     const dropped = lines.length - keep.length;
     if (dropped) {
       try { writeFileSync(SONG_ARCHIVE, keep.join('\n')); } catch { return 0; }
@@ -232,8 +233,14 @@ export class Downloader {
 
     let tail = '';        // rolling stderr/stdout tail for error reporting
     let lastBeat = Date.now();
+    let lastLine = '';
 
     const handleLine = (line) => {
+      // A dead Spotify session makes librespot repeat "Failed reading packet! Connection
+      // reset by peer" forever without exiting. A line identical to the previous one is
+      // not a sign of life, or that loop would hold the slot and block the queue.
+      const repeat = line === lastLine;
+      lastLine = line;
       tail = (tail + '\n' + line).slice(-4000);
       const now = Date.now();
       const c = line.match(TRACKS_RE);
@@ -247,7 +254,7 @@ export class Downloader {
         this.db.prepare(`UPDATE downloads SET progress = ?, updated_at = ? WHERE id = ?`)
           .run(pct, now, id);
         lastBeat = now;
-      } else if (now - lastBeat > 5000) {
+      } else if (!repeat && now - lastBeat > 5000) {
         // Heartbeat: real-time downloads emit output whose % we can't always parse.
         // Bump updated_at on any output so the stall-reaper only fires on true silence
         // (e.g. a process hung waiting on a prompt), not on a slow-but-live download.

@@ -12,7 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # The maintained fork (original zotify-dev repo is stale post Aug-2025 login change).
-RUN pip install "git+https://github.com/Googolplexed0/zotify.git"
+# Pinned: upstream changes the song-archive format and defaults between releases, and
+# downloader.js parses that archive. Bump deliberately and re-check _pruneArchive.
+RUN pip install "git+https://github.com/Googolplexed0/zotify.git@17919d9fbff2c7142023c39d803a071d794ce78b"
 
 # beets = MusicBrainz auto-tagger + directory organizer (the "retag/rename" step).
 # pyacoustid: chroma fingerprint matching; bs4/langdetect: lyrics plugin.
