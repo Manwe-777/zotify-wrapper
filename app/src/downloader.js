@@ -49,6 +49,10 @@ const PCT_RE = /(\d{1,3})%\|/;
 // Album-level tqdm shows a bare "3/11" count (byte bars show "2.1M/4.6M", so digits-only wins).
 const TRACKS_RE = /\|\s*(\d+)\/(\d+)\s*[[\]]/;
 const AUDIO_RE = /\.(mp3|ogg|m4a|flac|opus|aac|wav)$/i;
+// A track skipped via the global archive prints a SKIPPING line ending in
+// "(TRACK DOWNLOADED PREVIOUSLY)", then a FILE line with the path it was archived under.
+const SKIP_PREV_RE = /DOWNLOADED PREVIOUSLY\)/;
+const SKIP_FILE_RE = /^#+\s+FILE: "(.+)"\s+#+\s*$/;
 
 // "01. Next Year.mp3" -> { num: 1, name: "Next Year" }
 function parseTrackName(file) {
@@ -234,8 +238,11 @@ export class Downloader {
     let tail = '';        // rolling stderr/stdout tail for error reporting
     let lastBeat = Date.now();
     let lastLine = '';
+    const skipped = [];   // archived paths of tracks zotify skipped as already downloaded
 
     const handleLine = (line) => {
+      const sf = SKIP_PREV_RE.test(lastLine) && line.match(SKIP_FILE_RE);
+      if (sf) skipped.push(sf[1]);
       // A dead Spotify session makes librespot repeat "Failed reading packet! Connection
       // reset by peer" forever without exiting. A line identical to the previous one is
       // not a sign of life, or that loop would hold the slot and block the queue.
@@ -292,7 +299,28 @@ export class Downloader {
         }
 
         const produced = existsSync(jobDir) ? this._listFiles(jobDir) : [];
-        if (code === 0 && produced.length) {
+        if (code === 0 && skipped.length && !produced.some((f) => AUDIO_RE.test(f))) {
+          // Every track was already in the archive, so it was filed into the library by
+          // an earlier job. The archived paths point into that job's (deleted) staging dir.
+          const rel = skipped[0].replace(/^.*?\/job-\d+\//, '');
+          const info = albumInfoFromRel(rel);
+          const tracks = skipped
+            .map((f) => ({ ...parseTrackName(f), done: true }))
+            .sort((a, b) => (a.num ?? 9999) - (b.num ?? 9999));
+          this.db.prepare(`
+            UPDATE downloads
+            SET status = 'completed', progress = 100, file_path = NULL, file_size = 0,
+                title = ?, album = ?, artist = ?, year = ?,
+                tracks_done = ?, tracks_total = ?, current_track = NULL, tracks_json = ?,
+                completed_at = ?, updated_at = ?, pid = NULL, eta = NULL, speed = NULL
+            WHERE id = ?
+          `).run(
+            'already in library', info.album, info.artist, info.year,
+            tracks.length, tracks.length, JSON.stringify(tracks),
+            Date.now(), Date.now(), id,
+          );
+          this._cleanupJobDir(id);
+        } else if (code === 0 && produced.length) {
           try {
             const title = titleFromFiles(produced);
             const audio = produced.filter((f) => AUDIO_RE.test(f));

@@ -76,6 +76,7 @@ function row(d) {
     const n = done || tracks.length || 1;
     meta = `${n} track${n > 1 ? 's' : ''}`;
     if (d.file_size) meta += ` · ${fmtSize(d.file_size)}`;
+    else if (d.file_size === 0) meta += ' · already in library';
   }
 
   const actions = [];
